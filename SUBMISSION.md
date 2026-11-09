@@ -238,10 +238,20 @@ The first run picked P5 ("strict script"). Validation of P1 had come back at 10/
 
 ## 8. Scale
 Measured on public_03_load (12 workflows, 5 days, ~2M events/day incl. leads) on this laptop (8 logical cores, Windows):
-`SCALE_PLACEHOLDER`
+| metric (D0 of public_03, full detail in `reports/public_03_load.md`) | value |
+|---|---|
+| Ingest throughput | **~48,000 events/s** (840k events in 17 s) |
+| Wall per simulated day, controller + simulator | **~4.0 min** (203 s decide + 17 s ingest + 18 s simulator), within the 10-minute budget |
+| Cold-start history bootstrap (~5.5M events) | ~200 s, once |
+| Decision lag | 1 tick (15 sim-min) + ≤ 11 s of compute |
+| Peak RSS | ~1.96 GB |
+| Decisions | ≈ 2.3/hour (13 approval requests, 29 auto-applies) |
+
+Only D0 was run, because of time; the SRE budget is per day. The first real bottleneck I measured is not ingestion. It is **re-fetching each workflow's full config every tick**, which carries the ~100k-entry `lead_preferred_hour` map (85% of controller wall time). Cache by version and refetch on `config_changed`.
 
 **What breaks first at 10×** (≈6.5M dials/day, ~100 workflows):
-1. **Single-process JSON parsing.** At ~10× the per-day ingest time grows linearly. Fix: shard workflows across N worker processes; state is already per workflow. Tenant-aware hashing keeps a tenant's request budget in one place.
+0. **The per-tick config fetch** (measured above) goes to about 35 min per simulated day. Fix: cache the config by version.
+1. **Single-process JSON parsing.** At 48k events/s it holds 10× on paper (8.5M events/day ≈ 3 min). Beyond that, shard workflows across N worker processes; state is already per workflow. Tenant-aware hashing keeps a tenant's request budget in one place.
 2. **Fetching whole chunks** that mix all workflows. Fix: a per-workflow event topic (Kafka/Redis stream) in production.
 3. **Counter memory** is O(hours × 512 cells × options) per workflow, about 14 MB for a 12-day run, so 100 workflows ≈ 1.4 GB. Fix: roll hours older than 7 days into daily buckets.
 4. **The `lead_preferred_hour` payload** (≈100k entries per workflow per day) is sent in full config PUTs. Fix: a delta API, or cohort hour weights.
