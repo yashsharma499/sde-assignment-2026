@@ -1,0 +1,4 @@
+{"scenario":"public_02_incidents","sim_minute":3555,"ts":"2027-01-06T11:15:00+05:30","end_minute":14400,"finished":false,"tick_minutes":15,"credits_remaining":200.0,"chunks":115,"last_event_id":219830}
+{"scenario":"public_02_incidents","sim_minute":5145,"ts":"2027-01-07T13:45:00+05:30","end_minute":14400,"finished":false,"tick_minutes":15,"credits_remaining":192.0,"chunks":175,"last_event_id":235791}
+=== restart and run to completion
+2026-11-09 22:58:42,458 INFO [01-14T00:00] - finished: scenario finished at 2027-01-14T00:00:00+05:30; wall 849s

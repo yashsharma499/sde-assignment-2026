@@ -7,7 +7,10 @@
 ## 0. TL;DR
 - `./run.sh <SIM_URL>` starts a single-process controller. Each 15-minute tick it ingests events into fixed-size numpy counters, reconciles governance, makes decisions, and checkpoints. Every decision and side effect goes to its own SQLite store first.
 - It owns **five loops**: caller-ID health (C5), call time per person derived from cohort profiles (C4), welcome × voice experiments with promotion, holdout and decay rollback (C6/C7), hallucination incident response (C8), and a governance client that batches into one routine request a day per workflow (C9).
-- **public_01:** zero harmful changes. The decaying W3 was rolled back about 2 days after onset. **public_02:** a bad supervisor prompt was detected and rolled back to the last-known-good prompt through an approval. The spam-flagged caller ID was quarantined within hours. Numbers are in §11.
+- **Results:**
+  - **public_01:** conclusion rate +17.9%, pickup +13.8%, engagement +2.6%. 37 changes applied, 2 harmful.
+  - **public_02:** conclusion rate +31.6%, pickup +26.1%, engagement +2.6%. Hallucinated calls 201 vs 416. Bad prompt fixed in 180 min for 8 credits. Flagged caller ID off within 2h. 45 changes applied, 1 harmful.
+  - **Crash test:** killed twice mid-run, including with an incident approval pending. The graded report is identical to the uninterrupted run. Details in §9 and §11.
 - **Deliberately not built:** proactive prompt optimisation (it can't be A/B tested per call), per-person call time from *personal* history (too sparse), fair-share credit scheduling across tenants (only per-incident caps), and a web UI (the supervisor view is a generated one-page Markdown file plus a CLI).
 
 ## 1. Assumptions
@@ -152,7 +155,8 @@ flowchart LR
 - After a promotion, the old champion stays on as a **20% holdout**.
 - Hourly, the controller compares the champion with the holdout over the last 36h. It rolls back if the window lift is significantly below the lift recorded at promotion (z ≤ −2 and the window lift < ⅓ of the promotion lift), or if the champion is now significantly worse than the holdout (z ≤ −2).
 - Rollbacks are *urgent*: they go out immediately inside approver hours, using the request slot reserved for urgent work.
-- public_01: W3 decayed from 1.15 to 0.93. It was rolled back on the second day after onset, and its share went 0.79 → 0.15 → 0 (report §11).
+- public_02: W3 (decays 1.18 → 0.90) was promoted, then rolled back on day 4 after onset (share 0.81 → 0.29 → 0).
+- public_01: the rule fired about an hour *before* onset. The promotion lift was inflated by the winner's curse, so a merely noisy window looked like decay. Directionally right, but graded harmful at that instant (§11).
 
 **Call time and caller ID.**
 - **History:** pickup by (age, tier, hour), standardised by attempt bucket (later attempts are harder leads), shrunk toward the age-band profile with a prior of 60 connects.
@@ -216,7 +220,19 @@ auto: intent ─PUT─► applied | auto_rejected(403) | stale(409, retry next t
 **Verification.** After the fix is applied, ≥300 connects on the fix prompt must show a flag rate ≤1.5× baseline (or Poisson p ≥ 0.01). Otherwise the incident reopens and the next candidate is tried.
 
 **public_02 timeline** (ks_cancel; from the audit store; times are simulated):
-`INCIDENT_TIMELINE_PLACEHOLDER`
+| sim time | event (from `view audit ks_cancel`) |
+|---|---|
+| D2 10:00 | *(hidden)* caller ID D2 is spam-flagged |
+| D2 11:00 | `did_status` D2 healthy → degraded (fast 3h window). Auto-apply quarantine step 1: D2 0.33 → 0.14 (max_shift 0.2) |
+| D2 12:00 | Quarantine step 2: D2 → 0, traffic on D1/D3 50/50. The grader shows D2's share at 0.074 on D2 and 0.0 every day after |
+| D3 11:30 | *(hidden)* supervisor ships P2 |
+| D3 11:45 | `supervisor_edit` recorded: "respected, not reverted"; flag watch tightened for 24h |
+| D3 13:00 | `incident_open`: 10 flags in 176 connects (5.7% vs 1.4% baseline, p=2.1e-4), **1.5h after the edit** |
+| D3 13:15 | P1 = last-known-good (286 flags in 20,535 production connects). Validated at n=800: pass 0.9875 (8 credits). No LLM call. Approval `apr_00009` filed, impact 0.95 |
+| D3 14:05 / 14:30 | Approved by the Kestrel approver; applied as v13 at the next tick |
+| D3 18:00 | `incident_resolved`: 5 flags in 314 connects on P1 (1.6% vs 1.4%). Verified fix |
+
+Grader: **MTTR 180 min** (edit → safe prompt live), fixed by `controller_approved`, **8 credits** in total. Hallucinated calls: 201 vs 416 for the no-op baseline.
 
 The first run picked P5 ("strict script"). Validation of P1 had come back at 10/800, which failed my original Wilson-bound bar, so the controller fell through to the LLM's suggestions. Engagement dropped 5%, which is exactly Anita's complaint. The recalibrated bar fixed it, and the run above uses it.
 
@@ -239,7 +255,10 @@ Decision lag is one tick (15 simulated minutes) plus the approver's latency. Dec
 3. Restart again and run to the end.
 4. Grade.
 
-`CRASH_PLACEHOLDER`
+Result (`logs/crash_public_02_incidents.log`, `reports/crash_public_02_incidents.md`):
+- **Crash 1 at D2 11:15.** This is one hour after the caller ID was flagged, mid-quarantine. The restart audit says `controller restarted at 2027-01-06T11:15; snapshot chunk 113, replaying newer chunks`.
+- **Crash 2 at D3 13:45.** This is **with the incident approval `apr_00009` pending**. On restart the approval was found in SQLite as `pending`, polled, then applied once at 14:30, exactly as in the uninterrupted run.
+- **The crashed run's graded report is identical to the uninterrupted run.** Same KPIs to three decimals, the same 45 changes with the same verdicts, `apply_conflicts: 0`, no duplicate proposal IDs, MTTR 180 min, 8 credits. The simulator is deterministic given the same actions, so identical output means the restarts changed no decision: nothing was double-applied, lost or forgotten.
 
 **What is lost on a crash.**
 - Up to one hour of counter updates. They are recomputed from chunks; nothing is lost.
@@ -259,9 +278,26 @@ Decision lag is one tick (15 simulated minutes) plus the approver's latency. Dec
 ## 10. Audit & observability
 **"Why did workflow X change at time T, who approved it, and what happened after?"**
 ```
-python -m controller.view --state state/public_02_incidents why ks_cancel "D3 17:00"
+python -m controller.view --state state/public_02_incidents why ks_cancel "D3 14:30"
 ```
-`WHY_PLACEHOLDER`
+```
+# Why did ks_cancel change around D3 14:30?
+- 01-07T11:45 SUPERVISOR: v12 by supervisor changed ['prompt_version']; respected, not reverted. prompt is now P2 (supervisor); watching flag rate
+## v13 applied D3 14:30 via approval apr_00009 (incident)
+- proposal: `ks_cancel:incident:5115:25` created D3 13:15
+- approved by the ks_cancel approver (apr_00009) 01-07T14:05 -> v13 dims=['prompt_version']
+- summary: Incident fix: switch prompt P2 -> P1 (hallucination flags 5.7% vs normal 1.4%)
+- rationale: P2 has been live since hour 83; flagged-hallucination rate 0.057 on 176 connects vs workflow baseline
+  0.0137 (Poisson p=2.1e-04). P1 is the last known-good prompt on this workflow (286/20535 flags, engagement 0.506
+  in production) and passed validation 0.988 (our bar: failure rate <= 0.0175).
+- impact score 0.95, affected leads 4351
+- dry run: {"validation": {"validation_run_id": "val_00001", ..., "n": 800, "failures": 10, "pass_rate": 0.9875}, ...}
+- before (24h): pickup 0.277, engagement 0.496, flags 0.0233 (4800 dials)
+- after  (24h): pickup 0.271, engagement 0.485, flags 0.0207 (4800 dials)
+- next events:
+  - 01-07T18:00 incident_resolved: P1 verified: 5 flags in 314 connects (0.0159 vs base 0.0137); time from detection to verified fix 5.0h, credits 8
+```
+(The "before/after 24h" windows straddle the incident: "before" includes 3h of P2. The per-hour rows are in `kpi_hourly`.)
 
 Other commands: `view audit <wf>` (full decision log), `view health` (loop metrics), and `state/<run>/supervisor_view.md` (one page, regenerated hourly).
 
@@ -275,11 +311,39 @@ Other commands: `view audit <wf>` (full decision log), `view health` (loop metri
 **Don't page (morning digest):** routine rejections and expiries, futile experiments, caller-ID probes, schedule refreshes, supervisor edits.
 
 ## 11. Results
-### public_01_dev
-`P01_PLACEHOLDER`
+### public_01_dev (`reports/public_01_dev.md`)
+| workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
+|---|---|---|---|---|---|---|---|---|
+| ks_cancel | 0.393 | +17.9% | 0.272 | +14.2% | 0.503 | +2.4% | 8% | 60 (47) |
+| nw_kyc | 0.462 | +27.2% | 0.295 | +21.9% | 0.600 | +1.5% | 0% | 28 (21) |
+| nw_renewal | 0.473 | +12.6% | 0.288 | +9.1% | 0.562 | +3.1% | 23% | 41 (42) |
+| ALL | 0.434 | +17.9% | 0.282 | +13.8% | 0.543 | +2.6% | 12% | 129 (110) |
 
-### public_02_incidents
-`P02_PLACEHOLDER`
+- 37 changes applied: 28 neutral, 7 beneficial, **2 harmful**.
+- Governance: 17 requests, 15 approved, 2 rejected (judgement calls), 0 expired, 0 lapsed, 0 apply conflicts. Peak 2 requests in any 24h per workflow. 0 credits.
+
+### public_02_incidents (`reports/public_02_incidents.md`)
+| workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
+|---|---|---|---|---|---|---|---|---|
+| ks_cancel | 0.385 | +55.6% | 0.259 | +41.0% | 0.509 | +6.8% | 38% | 107 (330) |
+| nw_kyc | 0.457 | +22.0% | 0.293 | +21.0% | 0.588 | -0.8% | 0% | 31 (31) |
+| nw_renewal | 0.503 | +18.0% | 0.301 | +14.9% | 0.560 | +2.2% | 23% | 63 (55) |
+| ALL | 0.440 | +31.6% | 0.280 | +26.1% | 0.544 | +2.6% | 29% | 201 (416) |
+
+- 45 changes applied: 30 neutral, 14 beneficial, **1 harmful**.
+- Governance: 19 requests, 17 approved, 2 rejected, 0 expired, 0 lapsed, 0 apply conflicts.
+- Incidents: the flagged caller ID was off within 2h (share 0.0 every day after). The bad prompt was fixed in 180 min (MTTR). 8 credits.
+- Decay: W3 was rolled back on day 4 after onset (share 0.81 → 0.29 → 0).
+
+### Interpretation
+- **Where we helped.**
+  - Pickup is the big win everywhere, from caller-ID spreading (load) plus call time. On `nw_kyc` (pickup-primary) it's +21–22% with the engagement guardrail held (+1.5% / −0.8%). The −0.8% is inside the 2% guardrail and within noise.
+  - On the engagement-primary workflows, engagement is up 2–7% with a 23–38% share of the hidden engagement headroom captured. The headroom left is mostly segment effects (e.g. V3 for 60+, V2 for Tamil) that need more data than an 8–10 day run gives at our false-winner bar.
+- **Where we were harmful, and why.**
+  1. *public_01 `nw_renewal` v11: decay rollback W3 → W1 graded −5.9%.* W3 was promoted on day 2 with a measured lift of +27% (true +15%; winner's curse). On day 3 the 36h window read −1.6%, which tripped the decay rule *about an hour before* the true decay onset. W3 then really did decay to 0.93, so the decision was right in direction, but at the instant it was applied it removed a still-good arm. Fix I'd make next: compare the window against a *shrunken* promotion lift (e.g. halve it) instead of the raw estimate, and require two consecutive windows.
+  2. *public_01 `ks_cancel` v16 and public_02 `ks_cancel` v20: retiring a welcome message graded −1.5% / −2.3%.* W2 is truly +8% only for Hindi speakers (~4–5% overall). The arm was stopped as "futile" (estimated +1.1% after 2,900 connects) or as a noisy loser before the segment analysis had the power to find the Hindi effect. The fix: run the segment scan before retiring, and keep an arm alive if any segment has z > 2.
+  - Earlier iterations had 4–5 harmful changes per run. Each one led to a rule change described in §5/§7: the pooled caller-ID comparison, the re-probe share, the validation bar, futility on small lift only, and α = 0.005.
+- **What I'd change next:** a shrinkage estimator (empirical Bayes) for promotion and decay lifts; a randomised schedule holdout; and the post-apply engagement check on LLM-suggested prompts.
 
 ## 12. Trade-offs & rejected alternatives
 | Option | Why considered | Why rejected / what instead |
@@ -299,6 +363,7 @@ Other commands: `view audit <wf>` (full decision log), `view health` (loop metri
 - **LLM-suggested fixes have no engagement check after apply.** Last-known-good avoids the problem in both public scenarios, but not in a world where no clean prompt exists.
 - **Credit fairness across tenants is a per-incident cap**, not a scheduler.
 - **Tenant preferences are keyed by tenant ID**, so Anita's 2/day applies to all of Kestrel's workflows in the load scenario, not only her line.
+- **Commit history is coarse.** The work happened in one evening session. Commits were cut by component at the end rather than as I went. The real iteration story (each graded run → bug → rule change) is in §5, §7 and §11, and in the commit messages.
 - **Built in about one evening with heavy AI assistance.** I've read and can defend every line, but there are only light unit tests (`tests/test_controller.py`); most of the verification is the end-to-end runs here.
 
 ## 14. If this went to production at Formi next month
